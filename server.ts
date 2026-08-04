@@ -79,10 +79,43 @@ async function withKeyRotation<T>(fn: (client: GoogleGenAI) => Promise<T>): Prom
   throw lastErr;
 }
 
+// Gemini's TTS models return raw headerless PCM audio (mimeType like
+// "audio/L16;codec=pcm;rate=24000"), which browsers cannot play directly.
+// This wraps the raw PCM bytes in a minimal 44-byte WAV header so the
+// client's <audio> element can play it.
+function pcmToWav(pcmBuffer: Buffer, sampleRate = 24000, numChannels = 1, bitsPerSample = 16): Buffer {
+  const blockAlign = (numChannels * bitsPerSample) / 8;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = pcmBuffer.length;
+  const header = Buffer.alloc(44);
+
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16); // fmt chunk size
+  header.writeUInt16LE(1, 20); // PCM format
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(dataSize, 40);
+
+  return Buffer.concat([header, pcmBuffer]);
+}
+
+// Parses "audio/L16;codec=pcm;rate=24000" style mime types into a sample rate.
+function parsePcmSampleRate(mimeType: string): number {
+  const match = mimeType.match(/rate=(\d+)/);
+  return match ? parseInt(match[1], 10) : 24000;
+}
+
 // API Routes
 app.post("/api/chat", async (req, res) => {
   try {
-    const { message, history, ttsEnabled } = req.body;
+    const { message, history } = req.body;
     if (!message) {
       return res.status(400).json({ error: "Xabar matni kiritilmagan." });
     }
@@ -203,53 +236,73 @@ app.post("/api/chat", async (req, res) => {
     const detectedEmotion = parsedResponse.emotion || "jiddiy";
     const detectedAction = parsedResponse.action || { type: "none" };
 
-    let base64Audio = null;
-    let audioMimeType = "audio/mp3";
-
-    // Optional: Call Gemini TTS with a strict 1.5s timeout so it never delays the chat response.
-    // Uses an AbortController so the underlying request is actually cancelled on timeout
-    // instead of continuing in the background and burning quota.
-    if (ttsEnabled && replyText) {
-      const abortController = new AbortController();
-      const timeoutId = setTimeout(() => abortController.abort(), 1500);
-      try {
-        const ttsResponse: any = await withKeyRotation((ai) => ai.models.generateContent({
-          model: "gemini-3.1-flash-tts-preview",
-          contents: [{ parts: [{ text: replyText }] }],
-          config: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: "Kore" },
-              },
-            },
-            abortSignal: abortController.signal,
-          },
-        }));
-
-        const inlineData = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData;
-        base64Audio = inlineData?.data || null;
-        if (inlineData?.mimeType) {
-          audioMimeType = inlineData.mimeType;
-        }
-      } catch (ttsErr: any) {
-        // Fall back silently to client Web Speech synthesis if TTS API rate limit or timeout occurs
-        base64Audio = null;
-      } finally {
-        clearTimeout(timeoutId);
-      }
-    }
-
+    // Text/emotion/action are returned immediately — TTS audio is fetched
+    // separately via /api/tts so a slow voice generation never delays the
+    // chat bubble from appearing.
     res.json({
       reply: replyText,
       emotion: detectedEmotion,
       action: detectedAction,
-      audio: base64Audio,
-      audioMimeType: audioMimeType,
     });
   } catch (error: any) {
     console.error("Chat error:", error);
     res.status(500).json({ error: error.message || "Xatolik yuz berdi." });
+  }
+});
+
+// Separate TTS endpoint, called by the client after the text reply is
+// already on screen. Kept independent from /api/chat so a slow or failing
+// voice generation never blocks or breaks the text conversation.
+app.post("/api/tts", async (req, res) => {
+  const { text } = req.body;
+  if (!text) {
+    return res.status(400).json({ error: "Matn kiritilmagan." });
+  }
+
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), 8000);
+  try {
+    const ttsResponse: any = await withKeyRotation((ai) => ai.models.generateContent({
+      model: "gemini-3.1-flash-tts-preview",
+      contents: [{ parts: [{ text }] }],
+      config: {
+        responseModalities: ["AUDIO"],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: "Kore" },
+          },
+        },
+        abortSignal: abortController.signal,
+      },
+    }));
+
+    const inlineData = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+    if (!inlineData?.data) {
+      return res.status(502).json({ error: "TTS audio qaytmadi." });
+    }
+
+    const rawMimeType: string = inlineData.mimeType || "audio/L16;codec=pcm;rate=24000";
+    // Gemini TTS returns headerless PCM — wrap it as a real WAV file so the
+    // browser's <audio> element can actually play it.
+    let base64Audio: string;
+    let audioMimeType: string;
+    if (rawMimeType.includes("L16") || rawMimeType.includes("pcm")) {
+      const pcmBuffer = Buffer.from(inlineData.data, "base64");
+      const sampleRate = parsePcmSampleRate(rawMimeType);
+      const wavBuffer = pcmToWav(pcmBuffer, sampleRate);
+      base64Audio = wavBuffer.toString("base64");
+      audioMimeType = "audio/wav";
+    } else {
+      base64Audio = inlineData.data;
+      audioMimeType = rawMimeType;
+    }
+
+    res.json({ audio: base64Audio, audioMimeType });
+  } catch (ttsErr: any) {
+    console.error("TTS error:", ttsErr);
+    res.status(502).json({ error: ttsErr.message || "Ovoz yaratishda xatolik." });
+  } finally {
+    clearTimeout(timeoutId);
   }
 });
 

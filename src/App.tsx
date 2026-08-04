@@ -219,32 +219,108 @@ export default function App() {
     setBotState("idle");
   };
 
-  // Play audio using local browser SpeechSynthesis as fallback
+  // Play audio using local browser SpeechSynthesis as fallback.
+  // Waits for the voice list to actually load (often empty on first call,
+  // especially on Android Chrome) and falls back through nearby languages
+  // if no Uzbek voice is installed on the device.
   const playSpeechFallback = (text: string) => {
-    if ("speechSynthesis" in window) {
+    if (!("speechSynthesis" in window)) {
+      setBotState("idle");
+      return;
+    }
+
+    const speak = () => {
       try {
         window.speechSynthesis.cancel();
         const utterance = new SpeechSynthesisUtterance(text);
-        
         const voices = window.speechSynthesis.getVoices();
-        const uzVoice = voices.find(v => v.lang.startsWith("uz") || v.lang.includes("UZ"));
-        if (uzVoice) {
-          utterance.voice = uzVoice;
+
+        const preferred =
+          voices.find((v) => v.lang.startsWith("uz") || v.lang.includes("UZ")) ||
+          voices.find((v) => v.lang.startsWith("tr")) || // Turkish: closest widely-installed voice
+          voices.find((v) => v.lang.startsWith("ru")) ||
+          voices.find((v) => v.lang.startsWith("en")) ||
+          voices[0];
+
+        if (preferred) {
+          utterance.voice = preferred;
+          utterance.lang = preferred.lang;
         } else {
+          // No voices available at all on this device — still attempt uz-UZ.
           utterance.lang = "uz-UZ";
         }
-        
+
         utterance.onstart = () => setBotState("speaking");
         utterance.onend = () => setBotState("idle");
         utterance.onerror = () => setBotState("idle");
-        
+
         window.speechSynthesis.speak(utterance);
       } catch (err) {
         console.error("Local SpeechSynthesis failed:", err);
         setBotState("idle");
       }
+    };
+
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length === 0) {
+      // Voice list loads asynchronously on many browsers — wait for it
+      // instead of speaking immediately with an empty list (which is
+      // silent on several Android WebView/Chrome versions).
+      let spoken = false;
+      window.speechSynthesis.onvoiceschanged = () => {
+        if (spoken) return;
+        spoken = true;
+        speak();
+        window.speechSynthesis.onvoiceschanged = null;
+      };
+      setTimeout(() => {
+        if (spoken) return;
+        spoken = true;
+        speak();
+      }, 600);
     } else {
-      setBotState("idle");
+      speak();
+    }
+  };
+
+  // Fetches TTS audio for a reply from /api/tts (separate from /api/chat so
+  // a slow or failing voice call never delays or breaks the text message).
+  // Falls back to the browser's own speech synthesis on any failure.
+  const fetchAndPlayTts = async (text: string) => {
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error("TTS server xatosi");
+
+      const data = await res.json();
+      if (!data.audio) throw new Error("Audio topilmadi");
+
+      const binary = atob(data.audio);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const mimeType = data.audioMimeType || "audio/wav";
+      const blob = new Blob([bytes], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+
+      currentAudioRef.current = audio;
+      setBotState("speaking");
+      audio.play().catch((playErr) => {
+        console.error("Audio playback error, falling back to Web Speech:", playErr);
+        playSpeechFallback(text);
+      });
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        setBotState("idle");
+      };
+    } catch (err) {
+      console.error("Gemini TTS failed, falling back to Web Speech:", err);
+      playSpeechFallback(text);
     }
   };
 
@@ -359,7 +435,6 @@ export default function App() {
         body: JSON.stringify({
           message: userText,
           history: historyPayload,
-          ttsEnabled: ttsEnabled,
         }),
       });
 
@@ -414,36 +489,10 @@ export default function App() {
         }
       }
 
-      // Voice output play back
-      if (data.audio && ttsEnabled) {
-        try {
-          const binary = atob(data.audio);
-          const bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i++) {
-            bytes[i] = binary.charCodeAt(i);
-          }
-          const mimeType = data.audioMimeType || "audio/mp3";
-          const blob = new Blob([bytes], { type: mimeType });
-          const url = URL.createObjectURL(blob);
-          const audio = new Audio(url);
-
-          currentAudioRef.current = audio;
-          setBotState("speaking");
-          audio.play().catch((playErr) => {
-            console.error("Audio playback error, falling back to Web Speech:", playErr);
-            playSpeechFallback(robotReply);
-          });
-
-          audio.onended = () => {
-            setBotState("idle");
-          };
-        } catch (decodeErr) {
-          console.error("Audio decoding error, falling back to Web Speech:", decodeErr);
-          playSpeechFallback(robotReply);
-        }
-      } else if (ttsEnabled && robotReply) {
-        // Fallback directly to local speech synthesis if server didn't generate audio (e.g. 503 error)
-        playSpeechFallback(robotReply);
+      // Voice output: chat bubble is already rendered above; fetch and play
+      // the voice separately so it never delays the text from appearing.
+      if (ttsEnabled && robotReply) {
+        fetchAndPlayTts(robotReply);
       } else {
         setBotState("idle");
       }
