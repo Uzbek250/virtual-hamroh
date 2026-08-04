@@ -1,0 +1,6 @@
+{
+  "name": "Virtual Hamroh-Robot",
+  "description": "O'zbek tilida gaplashadigan, turli xil hissiyotlarni ifodalaydigan virtual robot-hamroh ilovasi. Eslatmalar va kayfiyat kundaligi funksiyalariga ega.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
