@@ -211,6 +211,81 @@ app.delete("/api/memory/:id", async (req, res) => {
 });
 
 // API Routes
+
+/**
+ * Gemini TTS may return raw PCM/L16 audio. Browsers cannot reliably play raw
+ * PCM from an <audio> element, so wrap it in a valid RIFF/WAV container.
+ */
+function pcmToWav(
+  pcm: Buffer,
+  sampleRate = 24000,
+  channels = 1,
+  bitsPerSample = 16,
+): Buffer {
+  const blockAlign = channels * (bitsPerSample / 8);
+  const byteRate = sampleRate * blockAlign;
+  const wav = Buffer.alloc(44 + pcm.length);
+
+  wav.write("RIFF", 0);
+  wav.writeUInt32LE(36 + pcm.length, 4);
+  wav.write("WAVE", 8);
+  wav.write("fmt ", 12);
+  wav.writeUInt32LE(16, 16); // PCM header size
+  wav.writeUInt16LE(1, 20); // PCM format
+  wav.writeUInt16LE(channels, 22);
+  wav.writeUInt32LE(sampleRate, 24);
+  wav.writeUInt32LE(byteRate, 28);
+  wav.writeUInt16LE(blockAlign, 32);
+  wav.writeUInt16LE(bitsPerSample, 34);
+  wav.write("data", 36);
+  wav.writeUInt32LE(pcm.length, 40);
+  pcm.copy(wav, 44);
+
+  return wav;
+}
+
+function normalizeTtsAudio(
+  base64: string,
+  mimeType?: string,
+): { data: string; mimeType: string } {
+  const normalizedMime = String(mimeType || "").toLowerCase();
+
+  // Gemini commonly returns audio/L16; sample rate can be included as
+  // audio/L16;rate=24000. Extract it when available.
+  if (normalizedMime.includes("audio/l16") || normalizedMime.includes("audio/pcm")) {
+    const rateMatch = normalizedMime.match(/rate\s*=\s*(\d+)/i);
+    const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
+    const pcm = Buffer.from(base64, "base64");
+    const wav = pcmToWav(pcm, sampleRate, 1, 16);
+
+    return {
+      data: wav.toString("base64"),
+      mimeType: "audio/wav",
+    };
+  }
+
+  // If the provider already returned a browser-playable container, preserve it.
+  if (
+    normalizedMime.includes("audio/wav") ||
+    normalizedMime.includes("audio/mpeg") ||
+    normalizedMime.includes("audio/mp3") ||
+    normalizedMime.includes("audio/ogg") ||
+    normalizedMime.includes("audio/webm")
+  ) {
+    return {
+      data: base64,
+      mimeType: normalizedMime.split(";")[0] || "audio/wav",
+    };
+  }
+
+  // Safer default for unknown raw audio from Gemini.
+  const wav = pcmToWav(Buffer.from(base64, "base64"), 24000, 1, 16);
+  return {
+    data: wav.toString("base64"),
+    mimeType: "audio/wav",
+  };
+}
+
 app.post("/api/chat", async (req, res) => {
   try {
     const parsedRequest = chatRequestSchema.safeParse(req.body);
@@ -345,14 +420,14 @@ app.post("/api/chat", async (req, res) => {
     // This avoids duplicate rows when the same response is retried after a network timeout.
 
     let base64Audio = null;
-    let audioMimeType = "audio/mp3";
+    let audioMimeType = "audio/wav";
 
-    // Optional: Call Gemini TTS with a strict 1.5s timeout so it never delays the chat response.
-    // Uses an AbortController so the underlying request is actually cancelled on timeout
-    // instead of continuing in the background and burning quota.
+    // TTS is optional. Give Gemini enough time to generate speech, while
+    // still keeping the request bounded. If it fails, the client falls back
+    // to the browser's Web Speech API.
     if (ttsEnabled && replyText) {
       const abortController = new AbortController();
-      const timeoutId = setTimeout(() => abortController.abort(), 1500);
+      const timeoutId = setTimeout(() => abortController.abort(), 5000);
       try {
         const ttsResponse: any = await withKeyRotation((ai) => ai.models.generateContent({
           model: "gemini-3.1-flash-tts-preview",
@@ -369,9 +444,13 @@ app.post("/api/chat", async (req, res) => {
         }));
 
         const inlineData = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData;
-        base64Audio = inlineData?.data || null;
-        if (inlineData?.mimeType) {
-          audioMimeType = inlineData.mimeType;
+        if (inlineData?.data) {
+          const normalizedAudio = normalizeTtsAudio(
+            inlineData.data,
+            inlineData.mimeType,
+          );
+          base64Audio = normalizedAudio.data;
+          audioMimeType = normalizedAudio.mimeType;
         }
       } catch (ttsErr: any) {
         // Fall back silently to client Web Speech synthesis if TTS API rate limit or timeout occurs

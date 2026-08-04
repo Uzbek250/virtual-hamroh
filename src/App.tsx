@@ -512,21 +512,43 @@ export default function App() {
           for (let i = 0; i < binary.length; i++) {
             bytes[i] = binary.charCodeAt(i);
           }
-          const mimeType = data.audioMimeType || "audio/mp3";
+          const mimeType = data.audioMimeType || "audio/wav";
           const blob = new Blob([bytes], { type: mimeType });
           const url = URL.createObjectURL(blob);
-          const audio = new Audio(url);
+          const audio = new Audio();
 
           currentAudioRef.current = audio;
           setBotState("speaking");
-          audio.play().catch((playErr) => {
-            console.error("Audio playback error, falling back to Web Speech:", playErr);
-            playSpeechFallback(robotReply);
-          });
 
           audio.onended = () => {
             setBotState("idle");
+            URL.revokeObjectURL(url);
+            if (currentAudioRef.current === audio) {
+              currentAudioRef.current = null;
+            }
           };
+
+          audio.onerror = (event) => {
+            console.error("Gemini TTS audio decode/playback error:", event);
+            setBotState("idle");
+            URL.revokeObjectURL(url);
+            if (currentAudioRef.current === audio) {
+              currentAudioRef.current = null;
+            }
+            playSpeechFallback(robotReply);
+          };
+
+          audio.src = url;
+          audio.load();
+          audio.play().catch((playErr) => {
+            console.error("Audio playback error, falling back to Web Speech:", playErr);
+            setBotState("idle");
+            URL.revokeObjectURL(url);
+            if (currentAudioRef.current === audio) {
+              currentAudioRef.current = null;
+            }
+            playSpeechFallback(robotReply);
+          });
         } catch (decodeErr) {
           console.error("Audio decoding error, falling back to Web Speech:", decodeErr);
           playSpeechFallback(robotReply);

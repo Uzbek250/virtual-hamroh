@@ -39,3 +39,13 @@ Keep `SUPABASE_SERVICE_ROLE_KEY` server-side only. Never expose it in React/Vite
 ## Important architecture note
 
 The current anonymous `userId` is a V3.1 bridge. It is not authentication. Anyone who clears browser storage gets a new identity. The next recommended version is real authentication plus a memory management UI and a proper Action Router.
+
+
+## V3.1.1 TTS patch
+
+This release fixes Gemini TTS playback when Gemini returns raw PCM/L16 audio.
+The server converts raw PCM to a browser-compatible WAV container before sending
+it to the frontend. The TTS timeout is increased to 5 seconds and the browser
+falls back to Web Speech when Gemini TTS is unavailable.
+
+After deploying, no new environment variable is required.
