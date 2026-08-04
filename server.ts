@@ -3,6 +3,7 @@ import path from "path";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
+import { z } from "zod";
 
 dotenv.config();
 
@@ -79,46 +80,144 @@ async function withKeyRotation<T>(fn: (client: GoogleGenAI) => Promise<T>): Prom
   throw lastErr;
 }
 
-// Gemini's TTS models return raw headerless PCM audio (mimeType like
-// "audio/L16;codec=pcm;rate=24000"), which browsers cannot play directly.
-// This wraps the raw PCM bytes in a minimal 44-byte WAV header so the
-// client's <audio> element can play it.
-function pcmToWav(pcmBuffer: Buffer, sampleRate = 24000, numChannels = 1, bitsPerSample = 16): Buffer {
-  const blockAlign = (numChannels * bitsPerSample) / 8;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = pcmBuffer.length;
-  const header = Buffer.alloc(44);
 
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + dataSize, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16); // fmt chunk size
-  header.writeUInt16LE(1, 20); // PCM format
-  header.writeUInt16LE(numChannels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(dataSize, 40);
+// ---------- V3.1 DATA LAYER ----------
+type StoredMessage = { id: string; user_id?: string; role: "user" | "assistant"; text: string; emotion?: string; timestamp: string };
+type StoredReminder = { id: string; user_id?: string; text: string; time_string: string; date_time: string; triggered: boolean; created_at: string };
+type StoredMood = { id: string; user_id?: string; mood: string; note: string; date: string; timestamp: string };
+type StoredMemory = { id: string; user_id?: string; content: string; category: string; importance: number; created_at: string };
 
-  return Buffer.concat([header, pcmBuffer]);
+const memoryStore = {
+  chat_messages: new Map<string, StoredMessage[]>(),
+  reminders: new Map<string, StoredReminder[]>(),
+  moods: new Map<string, StoredMood[]>(),
+  memories: new Map<string, StoredMemory[]>(),
+};
+
+const supabaseUrl = process.env.SUPABASE_URL?.replace(/\/$/, "");
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+const hasSupabase = Boolean(supabaseUrl && supabaseKey);
+
+async function dbRequest<T = any>(table: string, method: string, query = "", body?: any): Promise<T> {
+  if (!hasSupabase) throw new Error("SUPABASE_NOT_CONFIGURED");
+  const response = await fetch(`${supabaseUrl}/rest/v1/${table}${query}`, {
+    method,
+    headers: { apikey: supabaseKey!, Authorization: `Bearer ${supabaseKey}`, "Content-Type": "application/json", Prefer: "return=representation" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(`Database error ${response.status}: ${await response.text()}`);
+  const text = await response.text();
+  return (text ? JSON.parse(text) : null) as T;
 }
-
-// Parses "audio/L16;codec=pcm;rate=24000" style mime types into a sample rate.
-function parsePcmSampleRate(mimeType: string): number {
-  const match = mimeType.match(/rate=(\d+)/);
-  return match ? parseInt(match[1], 10) : 24000;
+function safeUserId(value: unknown): string {
+  const id = String(value || "").trim();
+  if (!/^[a-zA-Z0-9_-]{8,100}$/.test(id)) throw new Error("Noto'g'ri userId.");
+  return id;
 }
+const chatRequestSchema = z.object({
+  userId: z.string().min(8).max(100),
+  message: z.string().trim().min(1).max(10000),
+  history: z.array(z.object({ role: z.string(), text: z.string().max(20000) })).max(30).optional().default([]),
+  ttsEnabled: z.boolean().optional().default(false),
+});
+const emotionSchema = z.enum(["xursand", "hayajon", "hafa", "oychan", "uyqu", "jiddiy", "hazil"]);
+const actionSchema = z.object({
+  type: z.enum(["eslatma", "kayfiyat", "none"]),
+  payload: z.object({ time: z.string().optional(), text: z.string().optional(), mood: z.string().optional(), note: z.string().optional() }).optional(),
+});
+const aiResponseSchema = z.object({ reply: z.string().min(1).max(20000), emotion: emotionSchema.catch("jiddiy"), action: actionSchema.default({ type: "none" }) });
+
+async function listUserData<T>(table: keyof typeof memoryStore, userId: string, order = "created_at.desc", limit = 100): Promise<T[]> {
+  if (hasSupabase) {
+    return (await dbRequest<T[]>(table, "GET", `?user_id=eq.${encodeURIComponent(userId)}&order=${order}&limit=${limit}`)) || [];
+  }
+  return (memoryStore[table] as Map<string, T[]>).get(userId)?.slice(-limit).reverse() || [];
+}
+async function insertUserData<T>(table: keyof typeof memoryStore, userId: string, row: T): Promise<T> {
+  if (hasSupabase) {
+    const result = await dbRequest<T[]>(table, "POST", "", { ...(row as any), user_id: userId });
+    return result?.[0] || row;
+  }
+  const map = memoryStore[table] as Map<string, T[]>;
+  const arr = map.get(userId) || [];
+  const next = arr.filter((x: any) => x.id !== (row as any).id); next.push(row); map.set(userId, next.slice(-1000));
+  return row;
+}
+async function deleteUserData(table: keyof typeof memoryStore, userId: string, id: string) {
+  if (hasSupabase) { await dbRequest(table, "DELETE", `?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}`); return; }
+  const map = memoryStore[table] as Map<string, any[]>;
+  map.set(userId, (map.get(userId) || []).filter(x => x.id !== id));
+}
+function normalizeMemoryText(text: string) { return text.replace(/\s+/g, " ").trim().slice(0, 1000); }
+
+app.get("/api/data", async (req, res) => {
+  try {
+    const userId = safeUserId(req.query.userId);
+    const [messages, reminders, moods, memories] = await Promise.all([
+      listUserData<StoredMessage>("chat_messages", userId, "timestamp.desc", 300),
+      listUserData<StoredReminder>("reminders", userId, "created_at.desc", 200),
+      listUserData<StoredMood>("moods", userId, "timestamp.desc", 200),
+      listUserData<StoredMemory>("memories", userId, "created_at.desc", 100),
+    ]);
+    res.json({ messages, reminders, moods, memories, persistence: hasSupabase ? "supabase" : "memory" });
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+app.post("/api/messages", async (req, res) => {
+  try {
+    const userId = safeUserId(req.body.userId);
+    const row = { id: String(req.body.id || crypto.randomUUID()), role: req.body.role === "user" ? "user" : "assistant", text: String(req.body.text || "").slice(0, 20000), emotion: req.body.emotion || undefined, timestamp: req.body.timestamp || new Date().toISOString() };
+    if (!row.text) return res.status(400).json({ error: "Xabar bo'sh." });
+    res.json(await insertUserData("chat_messages", userId, row));
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+app.post("/api/reminders", async (req, res) => {
+  try {
+    const userId = safeUserId(req.body.userId);
+    const date = new Date(req.body.dateTime);
+    if (!req.body.text || Number.isNaN(date.getTime())) return res.status(400).json({ error: "Reminder ma'lumotlari noto'g'ri." });
+    const row = { id: String(req.body.id || crypto.randomUUID()), text: String(req.body.text).trim().slice(0, 500), time_string: String(req.body.timeString || "").slice(0, 200), date_time: date.toISOString(), triggered: Boolean(req.body.triggered), created_at: req.body.createdAt || new Date().toISOString() };
+    res.json(await insertUserData("reminders", userId, row));
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+app.delete("/api/reminders/:id", async (req, res) => {
+  try { await deleteUserData("reminders", safeUserId(req.query.userId), req.params.id); res.json({ ok: true }); }
+  catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+app.post("/api/moods", async (req, res) => {
+  try {
+    const userId = safeUserId(req.body.userId);
+    const note = String(req.body.note || "").trim().slice(0, 2000);
+    if (!note) return res.status(400).json({ error: "Kayfiyat yozuvi bo'sh." });
+    const row = { id: String(req.body.id || crypto.randomUUID()), mood: String(req.body.mood || "normal").slice(0, 50), note, date: String(req.body.date || new Date().toISOString().slice(0, 10)), timestamp: req.body.timestamp || new Date().toISOString() };
+    res.json(await insertUserData("moods", userId, row));
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+app.delete("/api/moods/:id", async (req, res) => {
+  try { await deleteUserData("moods", safeUserId(req.query.userId), req.params.id); res.json({ ok: true }); }
+  catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+app.post("/api/memory", async (req, res) => {
+  try {
+    const userId = safeUserId(req.body.userId);
+    const content = normalizeMemoryText(String(req.body.content || ""));
+    if (!content) return res.status(400).json({ error: "Xotira matni bo'sh." });
+    const row = { id: String(req.body.id || crypto.randomUUID()), content, category: String(req.body.category || "general").slice(0, 50), importance: Math.min(10, Math.max(1, Number(req.body.importance || 5))), created_at: new Date().toISOString() };
+    res.json(await insertUserData("memories", userId, row));
+  } catch (e: any) { res.status(400).json({ error: e.message }); }
+});
+app.delete("/api/memory/:id", async (req, res) => {
+  try { await deleteUserData("memories", safeUserId(req.query.userId), req.params.id); res.json({ ok: true }); }
+  catch (e: any) { res.status(400).json({ error: e.message }); }
+});
 
 // API Routes
 app.post("/api/chat", async (req, res) => {
   try {
-    const { message, history } = req.body;
-    if (!message) {
-      return res.status(400).json({ error: "Xabar matni kiritilmagan." });
-    }
+    const parsedRequest = chatRequestSchema.safeParse(req.body);
+    if (!parsedRequest.success) return res.status(400).json({ error: "So'rov formati noto'g'ri.", details: parsedRequest.error.flatten() });
+    const { userId, message, history, ttsEnabled } = parsedRequest.data;
+    const memories = await listUserData<StoredMemory>("memories", userId, "created_at.desc", 20);
+    const memoryContext = memories.length ? `\\nSaqlangan xotiralar:\\n${memories.map(m => `- ${m.content}`).join("\\n")}` : "";
 
     // System instruction for the virtual companion
     const systemInstruction = `
@@ -140,7 +239,7 @@ app.post("/api/chat", async (req, res) => {
       2a. Imlo qoidalariga qat'iy rioya qiling: lotin alifbosidagi "o'" va "g'" harflarini har doim to'g'ri tutuq belgisi (') bilan yozing (masalan: "bo'ldi", "kelg'usi"), kirill harflarini aslo ishlatmang, va so'zlarni standart o'zbek adabiy tili imlosiga mos yozing.
       3. Agar foydalanuvchi eslatma qo'yishni so'rasa (masalan: "ertaga soat 9da darsga eslatma qo'y", "soat 18:00da uchrashuvni eslat"), unga eslatma muvaffaqiyatli rejalashtirilganini va saqlanganini aytib, xursand yoki jiddiy holatda javob bering. Action obyektini to'ldiring: type="eslatma".
       4. Agar foydalanuvchi o'z kayfiyati haqida yozsa (kayfiyat kundaligi uchun, masalan: "bugun kayfiyatim yomon", "charchadim", "hursandman"), uning his-tuyg'ularini tushunishingizni bildiring (hamdardlik yoki tabrik) va qisqacha samimiy maslahat/tasalli bering. Action obyektini to'ldiring: type="kayfiyat".
-    `;
+    ` + memoryContext;
 
     // Format chat history for Gemini API content if present (limit to last 3 turns for speed)
     const contents: any[] = [];
@@ -232,77 +331,66 @@ app.post("/api/chat", async (req, res) => {
       };
     }
 
-    const replyText = parsedResponse.reply || "Ajoyib!";
-    const detectedEmotion = parsedResponse.emotion || "jiddiy";
-    const detectedAction = parsedResponse.action || { type: "none" };
+    const validated = aiResponseSchema.safeParse(parsedResponse);
+    const normalized = validated.success ? validated.data : {
+      reply: String(parsedResponse.reply || "Kechirasiz, javobni tayyorlashda xatolik yuz berdi."),
+      emotion: "jiddiy" as const,
+      action: { type: "none" as const }
+    };
+    const replyText = normalized.reply;
+    const detectedEmotion = normalized.emotion;
+    const detectedAction = normalized.action;
 
-    // Text/emotion/action are returned immediately — TTS audio is fetched
-    // separately via /api/tts so a slow voice generation never delays the
-    // chat bubble from appearing.
+    // Conversation and mood records are persisted by the client with stable IDs.
+    // This avoids duplicate rows when the same response is retried after a network timeout.
+
+    let base64Audio = null;
+    let audioMimeType = "audio/mp3";
+
+    // Optional: Call Gemini TTS with a strict 1.5s timeout so it never delays the chat response.
+    // Uses an AbortController so the underlying request is actually cancelled on timeout
+    // instead of continuing in the background and burning quota.
+    if (ttsEnabled && replyText) {
+      const abortController = new AbortController();
+      const timeoutId = setTimeout(() => abortController.abort(), 1500);
+      try {
+        const ttsResponse: any = await withKeyRotation((ai) => ai.models.generateContent({
+          model: "gemini-3.1-flash-tts-preview",
+          contents: [{ parts: [{ text: replyText }] }],
+          config: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: "Kore" },
+              },
+            },
+            abortSignal: abortController.signal,
+          },
+        }));
+
+        const inlineData = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+        base64Audio = inlineData?.data || null;
+        if (inlineData?.mimeType) {
+          audioMimeType = inlineData.mimeType;
+        }
+      } catch (ttsErr: any) {
+        // Fall back silently to client Web Speech synthesis if TTS API rate limit or timeout occurs
+        base64Audio = null;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+
     res.json({
       reply: replyText,
       emotion: detectedEmotion,
       action: detectedAction,
+      audio: base64Audio,
+      audioMimeType: audioMimeType,
     });
   } catch (error: any) {
     console.error("Chat error:", error);
     res.status(500).json({ error: error.message || "Xatolik yuz berdi." });
-  }
-});
-
-// Separate TTS endpoint, called by the client after the text reply is
-// already on screen. Kept independent from /api/chat so a slow or failing
-// voice generation never blocks or breaks the text conversation.
-app.post("/api/tts", async (req, res) => {
-  const { text } = req.body;
-  if (!text) {
-    return res.status(400).json({ error: "Matn kiritilmagan." });
-  }
-
-  const abortController = new AbortController();
-  const timeoutId = setTimeout(() => abortController.abort(), 8000);
-  try {
-    const ttsResponse: any = await withKeyRotation((ai) => ai.models.generateContent({
-      model: "gemini-3.1-flash-tts-preview",
-      contents: [{ parts: [{ text }] }],
-      config: {
-        responseModalities: ["AUDIO"],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: "Kore" },
-          },
-        },
-        abortSignal: abortController.signal,
-      },
-    }));
-
-    const inlineData = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData;
-    if (!inlineData?.data) {
-      return res.status(502).json({ error: "TTS audio qaytmadi." });
-    }
-
-    const rawMimeType: string = inlineData.mimeType || "audio/L16;codec=pcm;rate=24000";
-    // Gemini TTS returns headerless PCM — wrap it as a real WAV file so the
-    // browser's <audio> element can actually play it.
-    let base64Audio: string;
-    let audioMimeType: string;
-    if (rawMimeType.includes("L16") || rawMimeType.includes("pcm")) {
-      const pcmBuffer = Buffer.from(inlineData.data, "base64");
-      const sampleRate = parsePcmSampleRate(rawMimeType);
-      const wavBuffer = pcmToWav(pcmBuffer, sampleRate);
-      base64Audio = wavBuffer.toString("base64");
-      audioMimeType = "audio/wav";
-    } else {
-      base64Audio = inlineData.data;
-      audioMimeType = rawMimeType;
-    }
-
-    res.json({ audio: base64Audio, audioMimeType });
-  } catch (ttsErr: any) {
-    console.error("TTS error:", ttsErr);
-    res.status(502).json({ error: ttsErr.message || "Ovoz yaratishda xatolik." });
-  } finally {
-    clearTimeout(timeoutId);
   }
 });
 

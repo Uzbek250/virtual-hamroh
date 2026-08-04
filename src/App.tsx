@@ -37,16 +37,31 @@ import {
 } from "lucide-react";
 
 export default function App() {
+  // Stable anonymous user identity. Replace with real auth later without changing the data model.
+  const [userId] = useState(() => {
+    const key = "hamroh_user_id";
+    const existing = localStorage.getItem(key);
+    if (existing) return existing;
+    const created = `u_${crypto.randomUUID()}`;
+    localStorage.setItem(key, created);
+    return created;
+  });
+  const hydratedRef = useRef(false);
+
   // State variables
-  const [messages, setMessages] = useState<Message[]>([
-    {
+  const [messages, setMessages] = useState<Message[]>(() => {
+    const saved = localStorage.getItem("hamroh_messages");
+    if (saved) {
+      try { return JSON.parse(saved); } catch {}
+    }
+    return [{
       id: "init",
       role: "assistant",
       text: "Salom! Men sizning samimiy virtual robot hamrohingizman. O'zbek tilida muloqot qila olaman. Menga istalgan narsani yozishingiz, darslaringiz uchun eslatmalar qo'yishimni so'rashingiz ('ertaga soat 9da darsni eslat' kabi) yoki bugungi kayfiyatingiz bilan bo'lishishingiz mumkin! 😊",
       emotion: "xursand",
       timestamp: new Date().toISOString(),
-    },
-  ]);
+    }];
+  });
   const [currentMessage, setCurrentMessage] = useState("");
   const [emotion, setEmotion] = useState<EmotionType>("xursand");
   const [botState, setBotState] = useState<BotState>("idle");
@@ -92,6 +107,74 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem("hamroh_moods", JSON.stringify(moodEntries));
+  }, [moodEntries]);
+  useEffect(() => {
+    localStorage.setItem("hamroh_messages", JSON.stringify(messages));
+  }, [messages]);
+
+  // V3.1 server synchronization. The app still keeps localStorage as a fast offline cache.
+  const syncReminder = async (reminder: Reminder) => {
+    try {
+      await fetch("/api/reminders", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId, id: reminder.id, text: reminder.text, timeString: reminder.timeString, dateTime: reminder.dateTime, triggered: reminder.triggered, createdAt: reminder.createdAt }) });
+    } catch (error) { console.warn("Reminder server sync failed:", error); }
+  };
+  const syncMood = async (entry: MoodEntry) => {
+    try {
+      await fetch("/api/moods", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId, id: entry.id, mood: entry.mood, note: entry.note, date: entry.date, timestamp: entry.timestamp }) });
+    } catch (error) { console.warn("Mood server sync failed:", error); }
+  };
+  const syncMessage = async (message: Message) => {
+    try {
+      await fetch("/api/messages", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId, id: message.id, role: message.role, text: message.text, emotion: message.emotion, timestamp: message.timestamp }) });
+    } catch (error) { console.warn("Message server sync failed:", error); }
+  };
+
+  // Load persistent data from Render/Supabase when available.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch(`/api/data?userId=${encodeURIComponent(userId)}`);
+        if (!response.ok) return;
+        const data = await response.json();
+        if (cancelled) return;
+        if (Array.isArray(data.messages) && data.messages.length) {
+          const loadedMessages: Message[] = data.messages.slice().reverse().map((m: any) => ({
+            id: m.id, role: m.role, text: m.text, emotion: m.emotion, timestamp: m.timestamp
+          }));
+          setMessages(loadedMessages);
+          localStorage.setItem("hamroh_messages", JSON.stringify(loadedMessages));
+        }
+        if (Array.isArray(data.reminders) && data.reminders.length) {
+          const loaded = data.reminders.slice().reverse().map((r: any) => ({
+            id: r.id, text: r.text, timeString: r.timeString ?? r.time_string, dateTime: r.dateTime ?? r.date_time,
+            triggered: Boolean(r.triggered), createdAt: r.createdAt ?? r.created_at
+          }));
+          setReminders(loaded); localStorage.setItem("hamroh_reminders", JSON.stringify(loaded));
+        }
+        if (Array.isArray(data.moods) && data.moods.length) {
+          const loaded = data.moods.slice().reverse().map((m: any) => ({
+            id: m.id, mood: m.mood, note: m.note, date: m.date, timestamp: m.timestamp
+          }));
+          setMoodEntries(loaded); localStorage.setItem("hamroh_moods", JSON.stringify(loaded));
+        }
+      } catch (error) { console.warn("Persistent data load failed:", error); }
+      finally { hydratedRef.current = true; }
+    })();
+    return () => { cancelled = true; };
+  }, [userId]);
+
+  // Sync changes after initial hydration.
+  useEffect(() => {
+    if (!hydratedRef.current) return;
+    reminders.forEach(syncReminder);
+  }, [reminders]);
+  useEffect(() => {
+    if (!hydratedRef.current) return;
+    moodEntries.forEach(syncMood);
   }, [moodEntries]);
 
   // Scroll to bottom of chat
@@ -219,108 +302,32 @@ export default function App() {
     setBotState("idle");
   };
 
-  // Play audio using local browser SpeechSynthesis as fallback.
-  // Waits for the voice list to actually load (often empty on first call,
-  // especially on Android Chrome) and falls back through nearby languages
-  // if no Uzbek voice is installed on the device.
+  // Play audio using local browser SpeechSynthesis as fallback
   const playSpeechFallback = (text: string) => {
-    if (!("speechSynthesis" in window)) {
-      setBotState("idle");
-      return;
-    }
-
-    const speak = () => {
+    if ("speechSynthesis" in window) {
       try {
         window.speechSynthesis.cancel();
         const utterance = new SpeechSynthesisUtterance(text);
+        
         const voices = window.speechSynthesis.getVoices();
-
-        const preferred =
-          voices.find((v) => v.lang.startsWith("uz") || v.lang.includes("UZ")) ||
-          voices.find((v) => v.lang.startsWith("tr")) || // Turkish: closest widely-installed voice
-          voices.find((v) => v.lang.startsWith("ru")) ||
-          voices.find((v) => v.lang.startsWith("en")) ||
-          voices[0];
-
-        if (preferred) {
-          utterance.voice = preferred;
-          utterance.lang = preferred.lang;
+        const uzVoice = voices.find(v => v.lang.startsWith("uz") || v.lang.includes("UZ"));
+        if (uzVoice) {
+          utterance.voice = uzVoice;
         } else {
-          // No voices available at all on this device — still attempt uz-UZ.
           utterance.lang = "uz-UZ";
         }
-
+        
         utterance.onstart = () => setBotState("speaking");
         utterance.onend = () => setBotState("idle");
         utterance.onerror = () => setBotState("idle");
-
+        
         window.speechSynthesis.speak(utterance);
       } catch (err) {
         console.error("Local SpeechSynthesis failed:", err);
         setBotState("idle");
       }
-    };
-
-    const voices = window.speechSynthesis.getVoices();
-    if (voices.length === 0) {
-      // Voice list loads asynchronously on many browsers — wait for it
-      // instead of speaking immediately with an empty list (which is
-      // silent on several Android WebView/Chrome versions).
-      let spoken = false;
-      window.speechSynthesis.onvoiceschanged = () => {
-        if (spoken) return;
-        spoken = true;
-        speak();
-        window.speechSynthesis.onvoiceschanged = null;
-      };
-      setTimeout(() => {
-        if (spoken) return;
-        spoken = true;
-        speak();
-      }, 600);
     } else {
-      speak();
-    }
-  };
-
-  // Fetches TTS audio for a reply from /api/tts (separate from /api/chat so
-  // a slow or failing voice call never delays or breaks the text message).
-  // Falls back to the browser's own speech synthesis on any failure.
-  const fetchAndPlayTts = async (text: string) => {
-    try {
-      const res = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-      if (!res.ok) throw new Error("TTS server xatosi");
-
-      const data = await res.json();
-      if (!data.audio) throw new Error("Audio topilmadi");
-
-      const binary = atob(data.audio);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-      }
-      const mimeType = data.audioMimeType || "audio/wav";
-      const blob = new Blob([bytes], { type: mimeType });
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-
-      currentAudioRef.current = audio;
-      setBotState("speaking");
-      audio.play().catch((playErr) => {
-        console.error("Audio playback error, falling back to Web Speech:", playErr);
-        playSpeechFallback(text);
-      });
-      audio.onended = () => {
-        URL.revokeObjectURL(url);
-        setBotState("idle");
-      };
-    } catch (err) {
-      console.error("Gemini TTS failed, falling back to Web Speech:", err);
-      playSpeechFallback(text);
+      setBotState("idle");
     }
   };
 
@@ -345,6 +352,7 @@ export default function App() {
     };
 
     setReminders((prev) => [newRem, ...prev]);
+    syncReminder(newRem);
     setManualReminderText("");
     setManualReminderTime("");
     setShowAddReminderModal(false);
@@ -376,6 +384,7 @@ export default function App() {
     };
 
     setMoodEntries((prev) => [newEntry, ...prev]);
+    syncMood(newEntry);
     setManualMoodNote("");
     setShowAddMoodModal(false);
 
@@ -395,10 +404,12 @@ export default function App() {
   // Delete handlers
   const handleDeleteReminder = (id: string) => {
     setReminders((prev) => prev.filter((r) => r.id !== id));
+    fetch(`/api/reminders/${encodeURIComponent(id)}?userId=${encodeURIComponent(userId)}`, { method: "DELETE" }).catch(console.warn);
   };
 
   const handleDeleteMood = (id: string) => {
     setMoodEntries((prev) => prev.filter((m) => m.id !== id));
+    fetch(`/api/moods/${encodeURIComponent(id)}?userId=${encodeURIComponent(userId)}`, { method: "DELETE" }).catch(console.warn);
   };
 
   // Main chat submit logic
@@ -419,6 +430,7 @@ export default function App() {
     };
 
     setMessages((prev) => [...prev, userMsg]);
+    syncMessage(userMsg);
     setIsLoading(true);
     setBotState("thinking");
 
@@ -433,8 +445,10 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          userId,
           message: userText,
           history: historyPayload,
+          ttsEnabled: ttsEnabled,
         }),
       });
 
@@ -459,6 +473,7 @@ export default function App() {
         timestamp: new Date().toISOString(),
       };
       setMessages((prev) => [...prev, assistantMsg]);
+      syncMessage(assistantMsg);
 
       // Check and execute action detected by AI
       if (robotAction && robotAction.type !== "none") {
@@ -489,10 +504,36 @@ export default function App() {
         }
       }
 
-      // Voice output: chat bubble is already rendered above; fetch and play
-      // the voice separately so it never delays the text from appearing.
-      if (ttsEnabled && robotReply) {
-        fetchAndPlayTts(robotReply);
+      // Voice output play back
+      if (data.audio && ttsEnabled) {
+        try {
+          const binary = atob(data.audio);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          const mimeType = data.audioMimeType || "audio/mp3";
+          const blob = new Blob([bytes], { type: mimeType });
+          const url = URL.createObjectURL(blob);
+          const audio = new Audio(url);
+
+          currentAudioRef.current = audio;
+          setBotState("speaking");
+          audio.play().catch((playErr) => {
+            console.error("Audio playback error, falling back to Web Speech:", playErr);
+            playSpeechFallback(robotReply);
+          });
+
+          audio.onended = () => {
+            setBotState("idle");
+          };
+        } catch (decodeErr) {
+          console.error("Audio decoding error, falling back to Web Speech:", decodeErr);
+          playSpeechFallback(robotReply);
+        }
+      } else if (ttsEnabled && robotReply) {
+        // Fallback directly to local speech synthesis if server didn't generate audio (e.g. 503 error)
+        playSpeechFallback(robotReply);
       } else {
         setBotState("idle");
       }
