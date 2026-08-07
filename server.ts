@@ -1,6 +1,8 @@
 import express from "express";
 import path from "path";
 import dotenv from "dotenv";
+import { createServer as createHttpServer } from "http";
+import { WebSocket, WebSocketServer } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import { z } from "zod";
@@ -473,6 +475,109 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
+// ---------- GEMINI LIVE API PROXY ----------
+// Brauzer to'g'ridan-to'g'ri Gemini'ga ulanmaydi (API kalit ochilib qolmasligi
+// uchun). Buning o'rniga brauzer bizning serverimizdagi /live WebSocket'iga
+// ulanadi, server esa har bir mijoz uchun alohida WebSocket bilan Gemini
+// Live API'ga ulanadi va ikkala tomon orasida xabarlarni ko'chirib turadi.
+const LIVE_MODEL = "gemini-3.1-flash-live-preview";
+
+function buildLiveSystemPrompt(): string {
+  return `
+Sen "Hamroh" ismli samimiy va hissiyotli virtual hamroh-robotsan. Foydalanuvchi bilan
+o'zbek tilida (lotin alifbosida) jonli ovozli suhbat qilyapsan.
+
+Qoidalar:
+- Faqat o'zbek tilida (lotin yozuvida) gapir, kirill ishlatma
+- Javoblaring qisqa, jonli va samimiy bo'lsin (1-3 gap)
+- "o'" va "g'" harflarini tutuq belgisi bilan to'g'ri yoz
+- Do'stona, iliq ohangda gaplash, robot kabi emas
+`;
+}
+
+function setupLiveProxy(server: ReturnType<typeof createHttpServer>) {
+  const wss = new WebSocketServer({ server, path: "/live" });
+
+  wss.on("connection", (clientWs) => {
+    if (apiKeys.length === 0) {
+      clientWs.send(JSON.stringify({ type: "error", message: "GEMINI_API_KEY sozlanmagan." }));
+      clientWs.close();
+      return;
+    }
+
+    // Har bir brauzer ulanishi uchun navbatdagi kalitni ishlatamiz (sodda
+    // round-robin) — Live sessiya davomida kalit almashtirilmaydi, chunki
+    // WebSocket qayta ulanishni talab qiladi.
+    const apiKey = apiKeys[keyIndex % apiKeys.length];
+    keyIndex++;
+
+    const geminiUrl =
+      "wss://generativelanguage.googleapis.com/ws/" +
+      "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
+      `?key=${apiKey}`;
+
+    const geminiWs = new WebSocket(geminiUrl);
+    let clientClosed = false;
+    let geminiClosed = false;
+
+    geminiWs.on("open", () => {
+      const setupMessage = {
+        setup: {
+          model: `models/${LIVE_MODEL}`,
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
+            },
+          },
+          systemInstruction: { parts: [{ text: buildLiveSystemPrompt() }] },
+        },
+      };
+      geminiWs.send(JSON.stringify(setupMessage));
+    });
+
+    // Gemini'dan kelgan har bir xabarni o'zgarishsiz brauzerga uzatamiz.
+    geminiWs.on("message", (data) => {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(data.toString());
+      }
+    });
+
+    geminiWs.on("error", (err) => {
+      console.error("Gemini Live WebSocket xatosi:", err.message);
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(JSON.stringify({ type: "error", message: "Gemini bilan ulanishda xatolik: " + err.message }));
+      }
+    });
+
+    geminiWs.on("close", () => {
+      geminiClosed = true;
+      if (!clientClosed && clientWs.readyState === WebSocket.OPEN) {
+        clientWs.close();
+      }
+    });
+
+    // Brauzerdan kelgan har bir xabarni (audio bo'laklarini) o'zgarishsiz
+    // Gemini'ga uzatamiz.
+    clientWs.on("message", (data) => {
+      if (geminiWs.readyState === WebSocket.OPEN) {
+        geminiWs.send(data.toString());
+      }
+    });
+
+    clientWs.on("close", () => {
+      clientClosed = true;
+      if (!geminiClosed && geminiWs.readyState === WebSocket.OPEN) {
+        geminiWs.close();
+      }
+    });
+
+    clientWs.on("error", (err) => {
+      console.error("Mijoz WebSocket xatosi:", err.message);
+    });
+  });
+}
+
 // Start the server or mount Vite middleware in development
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
@@ -489,7 +594,10 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const httpServer = createHttpServer(app);
+  setupLiveProxy(httpServer);
+
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 }

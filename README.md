@@ -49,3 +49,21 @@ it to the frontend. The TTS timeout is increased to 5 seconds and the browser
 falls back to Web Speech when Gemini TTS is unavailable.
 
 After deploying, no new environment variable is required.
+
+## V3.2 Live voice conversation
+
+Added a direct, real-time voice conversation mode using the Gemini Live API,
+separate from the existing text chat + TTS flow.
+
+- Browser connects to `/live` (WebSocket) on the same server — not directly
+  to Gemini, so the API key never reaches the client.
+- The server proxies that connection to Gemini's `BidiGenerateContent`
+  WebSocket, using the same `GEMINI_API_KEY` pool as the rest of the app.
+- Microphone audio is captured and resampled to 16kHz PCM16 in an
+  AudioWorklet (`public/worklets/mic-processor.js`), streamed to the
+  server, and Gemini's 24kHz PCM16 audio replies are played back through
+  another AudioWorklet (`public/worklets/player-processor.js`).
+- No new environment variables are required — it reuses `GEMINI_API_KEY`
+  (and `GEMINI_API_KEY_2`, `_3`, ... if configured).
+- Click "Jonli suhbatni boshlash" on the main screen to start; the button
+  is independent of the existing text chat mic button.

@@ -15,6 +15,7 @@ import {
   getEmotionStatusUz,
 } from "./utils";
 import CompanionAvatar from "./components/CompanionAvatar";
+import { useLiveConversation } from "./hooks/useLiveConversation";
 import {
   Volume2,
   VolumeX,
@@ -34,6 +35,8 @@ import {
   X,
   PlusCircle,
   Menu,
+  PhoneCall,
+  PhoneOff,
 } from "lucide-react";
 
 export default function App() {
@@ -99,6 +102,19 @@ export default function App() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Gemini Live API orqali bevosita ovozli suhbat (matnli chatdan alohida
+  // rejim). Serverdagi /live WebSocket proxy'iga ulanadi.
+  const live = useLiveConversation();
+
+  // Live suhbat holatini mavjud botState/CompanionAvatar mexanizmiga
+  // sinxronlaymiz, shunda avatar bir xil animatsiya tizimidan foydalanadi.
+  useEffect(() => {
+    if (live.status === "listening") setBotState("listening");
+    else if (live.status === "speaking") setBotState("speaking");
+    else if (live.status === "connecting") setBotState("thinking");
+    else if (live.status === "idle" || live.status === "error") setBotState("idle");
+  }, [live.status]);
 
   // Sync state to localStorage
   useEffect(() => {
@@ -773,6 +789,46 @@ export default function App() {
 
                   {/* Character visual */}
                   <CompanionAvatar emotion={emotion} botState={botState} />
+
+                  {/* Gemini Live API orqali bevosita ovozli suhbat tugmasi */}
+                  <div className="mt-4 flex flex-col items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={live.status === "idle" || live.status === "error" ? live.start : live.stop}
+                      className={`flex items-center gap-2 px-6 py-3 rounded-full font-bold text-sm shadow-xl transition-all ${
+                        live.status === "listening" || live.status === "speaking" || live.status === "connecting"
+                          ? "bg-red-500 text-white animate-pulse"
+                          : "bg-indigo-600 text-white hover:bg-indigo-700"
+                      }`}
+                      id="live-conversation-btn"
+                    >
+                      {live.status === "listening" || live.status === "speaking" || live.status === "connecting" ? (
+                        <>
+                          <PhoneOff size={18} />
+                          Suhbatni tugatish
+                        </>
+                      ) : (
+                        <>
+                          <PhoneCall size={18} />
+                          Jonli suhbatni boshlash
+                        </>
+                      )}
+                    </button>
+                    {live.status === "connecting" && (
+                      <span className="text-xs text-indigo-500 font-semibold">Ulanmoqda...</span>
+                    )}
+                    {live.status === "listening" && (
+                      <span className="text-xs text-emerald-600 font-semibold">Eshityapman...</span>
+                    )}
+                    {live.status === "speaking" && (
+                      <span className="text-xs text-indigo-600 font-semibold">Gapiryapman...</span>
+                    )}
+                    {live.status === "error" && live.errorMessage && (
+                      <span className="text-xs text-red-500 font-semibold max-w-xs text-center">
+                        {live.errorMessage}
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 {/* Interactive Speech Log Block */}
