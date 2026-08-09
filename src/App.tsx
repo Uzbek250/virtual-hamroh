@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Message, Reminder, MoodEntry, EmotionType, BotState } from "./types";
 import { parseUzbekTime } from "./utils";
-import { useLiveConversation } from "./hooks/useLiveConversation";
+import { useLiveConversation, LiveActionEvent } from "./hooks/useLiveConversation";
 import { useLocalStorage } from "./hooks/useLocalStorage";
 import { syncUserCollection } from "./utils/persistence";
+import { GeminiVoiceName, isGeminiVoiceName } from "./config/voices";
 import AppHeader from "./components/AppHeader";
 import Sidebar from "./components/Sidebar";
 import ChatWindow from "./components/ChatWindow";
@@ -36,6 +37,7 @@ export default function App() {
   const [messages, setMessages] = useLocalStorage<Message[]>("hamroh_messages", [INITIAL_MESSAGE]);
   const [reminders, setReminders] = useLocalStorage<Reminder[]>("hamroh_reminders", []);
   const [moodEntries, setMoodEntries] = useLocalStorage<MoodEntry[]>("hamroh_moods", []);
+  const [voiceName, setVoiceName] = useLocalStorage<GeminiVoiceName>("hamroh_voice", "Kore");
   const [currentMessage, setCurrentMessage] = useState("");
   const [emotion, setEmotion] = useState<EmotionType>("xursand");
   const [botState, setBotState] = useState<BotState>("idle");
@@ -55,7 +57,27 @@ export default function App() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
-  const live = useLiveConversation();
+
+  useEffect(() => {
+    if (!isGeminiVoiceName(voiceName)) setVoiceName("Kore");
+  }, [voiceName, setVoiceName]);
+
+  const handleLiveAction = (event: LiveActionEvent) => {
+    if (event.type === "reminderCreated") {
+      const reminder = event.data as Reminder;
+      if (!reminder?.id || !reminder?.text || !reminder?.dateTime) return;
+      setReminders((prev) => prev.some((item) => item.id === reminder.id) ? prev : [reminder, ...prev]);
+      setToastMessage(`Eslatma saqlandi: "${reminder.text}"`);
+      return;
+    }
+
+    const mood = event.data as MoodEntry;
+    if (!mood?.id || !mood?.note) return;
+    setMoodEntries((prev) => prev.some((item) => item.id === mood.id) ? prev : [mood, ...prev]);
+    setToastMessage("Kayfiyat kundaligiga yozuv saqlandi.");
+  };
+
+  const live = useLiveConversation({ voiceName, onAction: handleLiveAction });
 
   useEffect(() => {
     if (live.status === "listening") setBotState("listening");
@@ -137,9 +159,7 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [setReminders]);
 
-  const showToast = (message: string) => {
-    setToastMessage(message);
-  };
+  const showToast = (message: string) => setToastMessage(message);
 
   const playAlarmSound = () => {
     try {
@@ -239,7 +259,7 @@ export default function App() {
     setMessages((prev) => [...prev, userMsg]); void syncMessage(userMsg); setIsLoading(true); setBotState("thinking");
     const historyPayload = messages.slice(-5).map((m) => ({ role: m.role, text: m.text }));
     try {
-      const response = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ userId, message: userText, history: historyPayload, ttsEnabled }) });
+      const response = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ userId, message: userText, history: historyPayload, ttsEnabled, voiceName }) });
       if (!response.ok) throw new Error("Server xatosi yoki ulanish uzildi.");
       const data = await response.json();
       const robotReply = data.reply;
@@ -283,7 +303,7 @@ export default function App() {
       <div className="absolute bottom-0 left-0 w-[500px] h-[500px] bg-sky-200/50 rounded-full blur-3xl -z-10" />
       <AppHeader ttsEnabled={ttsEnabled} onToggleTts={() => { const value = !ttsEnabled; setTtsEnabled(value); if (!value) stopAudio(); }} reminderCount={reminders.filter((r) => !r.triggered).length} moodCount={moodEntries.length} onOpenReminders={() => setActiveTab("reminders")} onOpenMood={() => setActiveTab("mood")} onToggleSidebar={() => setShowSidebar((v) => !v)} />
       <main className="flex-1 flex w-full max-w-7xl mx-auto overflow-hidden relative">
-        <Sidebar activeTab={activeTab} showSidebar={showSidebar} reminderCount={reminders.filter((r) => !r.triggered).length} moodCount={moodEntries.length} onSelectTab={setActiveTab} onClose={() => setShowSidebar(false)} />
+        <Sidebar activeTab={activeTab} showSidebar={showSidebar} reminderCount={reminders.filter((r) => !r.triggered).length} moodCount={moodEntries.length} voiceName={isGeminiVoiceName(voiceName) ? voiceName : "Kore"} onVoiceChange={setVoiceName} onSelectTab={setActiveTab} onClose={() => setShowSidebar(false)} />
         <div className="flex-1 flex flex-col overflow-hidden bg-transparent relative">
           {activeTab === "chat" && <ChatWindow emotion={emotion} botState={botState} live={live} messages={messages} isLoading={isLoading} chatEndRef={chatEndRef} currentMessage={currentMessage} isRecording={isRecording} onCurrentMessageChange={setCurrentMessage} onToggleRecording={toggleRecording} onSendMessage={handleSendMessage} onStopAudio={stopAudio} />}
           {activeTab === "reminders" && <ReminderPanel reminders={reminders} onAdd={() => setShowAddReminderModal(true)} onDelete={handleDeleteReminder} />}
