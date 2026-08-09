@@ -1,8 +1,8 @@
-# Virtual Hamroh V3.1
+# Virtual Hamroh V3.2
 
 Virtual Hamroh is an Uzbek-language AI companion built with React, Vite, Express, TypeScript and Gemini.
 
-## V3.1 changes
+## V3.2 changes
 
 - Server API validation with Zod.
 - Persistent data API for chat, reminders, moods and memories.
@@ -38,7 +38,7 @@ Keep `SUPABASE_SERVICE_ROLE_KEY` server-side only. Never expose it in React/Vite
 
 ## Important architecture note
 
-The current anonymous `userId` is a V3.1 bridge. It is not authentication. Anyone who clears browser storage gets a new identity. The next recommended version is real authentication plus a memory management UI and a proper Action Router.
+The current anonymous `userId` is a V3.2 bridge. It is not authentication. Anyone who clears browser storage gets a new identity. The next recommended version is real authentication plus a memory management UI and a proper Action Router.
 
 
 ## V3.1.1 TTS patch
