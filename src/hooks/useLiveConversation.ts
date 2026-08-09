@@ -15,21 +15,12 @@ interface UseLiveConversationResult {
 }
 
 interface UseLiveConversationOptions {
+  userId: string;
   voiceName: string;
   onAction?: (event: LiveActionEvent) => void;
 }
 
-// Kirish 16kHz, chiqish 24kHz — bular AudioWorklet fayllarida (mic-processor.js,
-// player-processor.js) qattiq belgilangan va shu yerda resample amalga oshadi.
-
-/**
- * Mimi bilan uzluksiz ovozli suhbatni boshqaradi: mikrofonni ochadi, PCM16
- * audio bo'laklarini backend orqali (server.ts dagi /live proxy) Gemini
- * Live API'ga oqizadi, va kelayotgan javob audiosini real vaqtda pleyback
- * qiladi. Backend WebSocket'i (wss emas, ws — brauzer bilan bir xil origin)
- * API kalitni frontendga chiqarmaydi.
- */
-export function useLiveConversation({ voiceName, onAction }: UseLiveConversationOptions): UseLiveConversationResult {
+export function useLiveConversation({ userId, voiceName, onAction }: UseLiveConversationOptions): UseLiveConversationResult {
   const [status, setStatus] = useState<LiveStatus>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -47,10 +38,8 @@ export function useLiveConversation({ voiceName, onAction }: UseLiveConversation
   const cleanup = useCallback(() => {
     micStreamRef.current?.getTracks().forEach((track) => track.stop());
     micStreamRef.current = null;
-
     micContextRef.current?.close().catch(() => {});
     micContextRef.current = null;
-
     playerContextRef.current?.close().catch(() => {});
     playerContextRef.current = null;
     playerNodeRef.current = null;
@@ -69,20 +58,13 @@ export function useLiveConversation({ voiceName, onAction }: UseLiveConversation
   }, [cleanup]);
 
   const start = useCallback(async () => {
-    if (status === "connecting" || status === "listening" || status === "speaking") {
-      return;
-    }
+    if (status === "connecting" || status === "listening" || status === "speaking") return;
     setErrorMessage(null);
     setStatus("connecting");
 
     try {
       const micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
       micStreamRef.current = micStream;
 
@@ -101,28 +83,20 @@ export function useLiveConversation({ voiceName, onAction }: UseLiveConversation
       micContextRef.current = micContext;
 
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const params = new URLSearchParams({ voiceName });
+      const params = new URLSearchParams({ userId, voiceName });
       const ws = new WebSocket(`${protocol}//${window.location.host}/live?${params.toString()}`);
       wsRef.current = ws;
 
       ws.onopen = () => {
         micNode.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
           if (ws.readyState !== WebSocket.OPEN) return;
-          const base64 = arrayBufferToBase64(event.data);
-          ws.send(
-            JSON.stringify({
-              realtimeInput: {
-                audio: { data: base64, mimeType: "audio/pcm;rate=16000" },
-              },
-            }),
-          );
+          ws.send(JSON.stringify({ realtimeInput: { audio: { data: arrayBufferToBase64(event.data), mimeType: "audio/pcm;rate=16000" } } }));
         };
       };
 
       ws.onmessage = (event) => {
         try {
-          const data = JSON.parse(event.data);
-          handleServerMessage(data);
+          handleServerMessage(JSON.parse(event.data));
         } catch (e) {
           console.error("Live xabarni o'qishda xatolik:", e);
         }
@@ -133,9 +107,7 @@ export function useLiveConversation({ voiceName, onAction }: UseLiveConversation
         setErrorMessage("Server bilan ulanishda xatolik yuz berdi.");
       };
 
-      ws.onclose = () => {
-        setStatus((prev) => (prev === "error" ? prev : "idle"));
-      };
+      ws.onclose = () => setStatus((prev) => (prev === "error" ? prev : "idle"));
 
       function handleServerMessage(data: any) {
         if (data.type === "error") {
@@ -175,44 +147,35 @@ export function useLiveConversation({ voiceName, onAction }: UseLiveConversation
           }
         }
 
-        if (serverContent.turnComplete) {
-          setStatus("listening");
-        }
+        if (serverContent.turnComplete) setStatus("listening");
       }
     } catch (err: any) {
       cleanup();
       setStatus("error");
       setErrorMessage(err?.message || "Mikrofonni ochib bo'lmadi.");
     }
-  }, [status, cleanup, voiceName]);
+  }, [status, cleanup, userId, voiceName]);
 
   useEffect(() => cleanup, [cleanup]);
-
   return { status, errorMessage, start, stop };
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   let binary = "";
   const bytes = new Uint8Array(buffer);
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary);
 }
 
 function base64ToInt16Array(base64: string): Int16Array {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return new Int16Array(bytes.buffer);
 }
 
 function int16ToFloat32(pcm16: Int16Array): Float32Array {
   const float32 = new Float32Array(pcm16.length);
-  for (let i = 0; i < pcm16.length; i++) {
-    float32[i] = pcm16[i] / 0x8000;
-  }
+  for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 0x8000;
   return float32;
 }
