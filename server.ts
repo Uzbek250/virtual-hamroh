@@ -113,7 +113,7 @@ const actionSchema = z.object({
   type: z.enum(["eslatma", "kayfiyat", "none"]),
   payload: z.object({ time: z.string().optional(), text: z.string().optional(), mood: z.string().optional(), note: z.string().optional() }).optional(),
 });
-const aiResponseSchema = z.object({ reply: z.string().min(1).max(20000), emotion: emotionSchema.catch("jiddiy"), action: actionSchema.default({ type: "none" }) });
+const aiResponseSchema = z.object({ reply: z.string().min(1).max(20000), emotion: emotionSchema.catch("jiddiy"), action: actionSchema.default({ type: "none" }), memory_to_save: z.string().trim().min(1).max(1000).optional() });
 
 async function listUserData<T>(table: keyof typeof memoryStore, userId: string, order = "created_at.desc", limit = 100): Promise<T[]> {
   if (hasSupabase) return (await dbRequest<T[]>(table, "GET", `?user_id=eq.${encodeURIComponent(userId)}&order=${order}&limit=${limit}`)) || [];
@@ -133,6 +133,34 @@ async function insertUserData<T>(table: keyof typeof memoryStore, userId: string
   return row;
 }
 
+function normalizeMemoryText(text: string) { return text.replace(/\s+/g, " ").trim().slice(0, 1000); }
+
+function normalizeMemoryKey(text: string): string {
+  return normalizeMemoryText(text)
+    .toLocaleLowerCase("uz-UZ")
+    .replace(/[.,!?;:()[\]{}"'`]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function saveMemoryIfNew(userId: string, content: string): Promise<StoredMemory | null> {
+  const normalizedContent = normalizeMemoryText(content);
+  const key = normalizeMemoryKey(normalizedContent);
+  if (!key) return null;
+
+  const recentMemories = await listUserData<StoredMemory>("memories", userId, "created_at.desc", 50);
+  if (recentMemories.some((memory) => normalizeMemoryKey(memory.content) === key)) return null;
+
+  const row: StoredMemory = {
+    id: crypto.randomUUID(),
+    content: normalizedContent,
+    category: "general",
+    importance: 5,
+    created_at: new Date().toISOString(),
+  };
+  return insertUserData("memories", userId, row);
+}
+
 async function deleteUserData(table: keyof typeof memoryStore, userId: string, id: string) {
   if (hasSupabase) {
     await dbRequest(table, "DELETE", `?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}`);
@@ -141,8 +169,6 @@ async function deleteUserData(table: keyof typeof memoryStore, userId: string, i
   const map = memoryStore[table] as Map<string, any[]>;
   map.set(userId, (map.get(userId) || []).filter((x) => x.id !== id));
 }
-
-function normalizeMemoryText(text: string) { return text.replace(/\s+/g, " ").trim().slice(0, 1000); }
 
 app.get("/api/data", async (req, res) => {
   try {
@@ -262,6 +288,9 @@ app.post("/api/chat", async (req, res) => {
       2a. Imlo qoidalariga qat'iy rioya qiling: lotin alifbosidagi "o'" va "g'" harflarini to'g'ri tutuq belgisi bilan yozing, kirill ishlatmang.
       3. Eslatma so'ralganda action type="eslatma" va payloadni to'ldiring.
       4. Kayfiyat kundaligi uchun action type="kayfiyat" va payloadni to'ldiring.
+      5. Xotira faqat haqiqatan muhim, kelajakdagi suhbatlarda foydali yoki takrorlanadigan ahamiyatga ega fakt paydo bo'lganda yaratiladi. Har bir xabar uchun xotira yaratmang.
+      6. Ism, sevimli yoki yoqtirmaydigan narsa, muhim sana, va'da, muhim odam, orzu, doimiy odat yoki muhim xavotir kabi ma'lumotlargina xotiraga loyiq.
+      7. memory_to_save kerak bo'lmasa uni bermang. Agar kerak bo'lsa, xotirani qisqa, aniq va uchinchi shaxsda yozing. Masalan: "Foydalanuvchining ismi Aziz" yoki "Imtihonlardan oldin xavotirlanadi".
     ` + memoryContext;
 
     const contents: any[] = [];
@@ -295,6 +324,7 @@ app.post("/api/chat", async (req, res) => {
               },
               required: ["type"],
             },
+            memory_to_save: { type: Type.STRING, description: "Optional short, third-person fact worth remembering for future conversations. Omit when there is nothing important to remember." },
           },
           required: ["reply", "emotion", "action"],
         },
@@ -309,6 +339,14 @@ app.post("/api/chat", async (req, res) => {
 
     const validated = aiResponseSchema.safeParse(parsedResponse);
     const normalized = validated.success ? validated.data : { reply: String(parsedResponse.reply || "Kechirasiz, javobni tayyorlashda xatolik yuz berdi."), emotion: "jiddiy" as const, action: { type: "none" as const } };
+    if (normalized.memory_to_save) {
+      try {
+        await saveMemoryIfNew(userId, normalized.memory_to_save);
+      } catch (memoryError: any) {
+        console.warn("Xotirani saqlashda xatolik:", memoryError?.message || memoryError);
+      }
+    }
+
     const replyText = normalized.reply;
     let base64Audio: string | null = null;
     let audioMimeType = "audio/wav";
@@ -338,8 +376,8 @@ app.post("/api/chat", async (req, res) => {
 
     res.json({ reply: replyText, emotion: normalized.emotion, action: normalized.action, audio: base64Audio, audioMimeType });
   } catch (error: any) {
-    console.error("Chat error:", error);
-    res.status(500).json({ error: error.message || "Xatolik yuz berdi." });
+    console.error("Chat API xatosi:", error);
+    res.status(500).json({ error: error?.message || "Server xatosi." });
   }
 });
 
@@ -355,6 +393,8 @@ Qoidalar:
 - "o'" va "g'" harflarini tutuq belgisi bilan to'g'ri yoz
 - Do'stona, iliq ohangda gaplash, robot kabi emas
 - Eslatma qo'yish yoki kayfiyat yozish so'ralganda mos funksiyani chaqir.
+- Muhim xotira saqlash kerak bo'lganda save_memory funksiyasini chaqir. Xotirani faqat haqiqatan muhim, kelajakdagi suhbatlarda foydali yoki takrorlanadigan ahamiyatga ega faktlar uchun saqla; har bir gapni xotiraga yozma.
+- Xotira matni qisqa, aniq va uchinchi shaxsda bo'lsin. Masalan: "Foydalanuvchining ismi Aziz" yoki "Imtihonlardan oldin xavotirlanadi".
 - Funksiya natijasini olmaguningcha "qo'shdim" yoki "saqlandi" deb tasdiqlama.
 - Funksiya muvaffaqiyatli natija qaytarganidan keyingina bajarilganini ayt.
 `;
@@ -385,6 +425,17 @@ const liveTools = [
             note: { type: "STRING", description: "Kayfiyatga oid qisqa izoh." },
           },
           required: ["mood", "note"],
+        },
+      },
+      {
+        name: "save_memory",
+        description: "Foydalanuvchi haqidagi kelajakdagi suhbatlarda foydali bo'ladigan muhim faktni xotiraga saqlaydi. Faqat muhim va takrorlanadigan ahamiyatga ega faktlar uchun ishlating.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            content: { type: "STRING", description: "Qisqa, aniq va uchinchi shaxsdagi xotira, masalan 'Foydalanuvchining ismi Aziz'." },
+          },
+          required: ["content"],
         },
       },
     ],
@@ -445,6 +496,16 @@ async function executeLiveFunction(name: string, args: any, userId: string) {
     };
   }
 
+  if (name === "save_memory") {
+    const content = String(args?.content || "").trim().slice(0, 1000);
+    if (!content) throw new Error("Xotira matni bo'sh.");
+    const saved = await saveMemoryIfNew(userId, content);
+    return {
+      status: saved ? "success" : "duplicate",
+      data: saved ? { id: saved.id, content: saved.content, createdAt: saved.created_at } : null,
+    };
+  }
+
   throw new Error(`Noma'lum Live funksiyasi: ${name}`);
 }
 
@@ -495,7 +556,7 @@ function setupLiveProxy(server: ReturnType<typeof createHttpServer>) {
         for (const functionCall of parsed.toolCall.functionCalls) {
           try {
             const result = await executeLiveFunction(functionCall.name, functionCall.args || {}, userId);
-            if (clientWs.readyState === WebSocket.OPEN && result.data) {
+            if (clientWs.readyState === WebSocket.OPEN && result.data && functionCall.name !== "save_memory") {
               const actionType = functionCall.name === "add_reminder" ? "reminderCreated" : "moodCreated";
               clientWs.send(JSON.stringify({ type: "liveAction", action: actionType, data: result.data }));
             }
@@ -511,11 +572,6 @@ function setupLiveProxy(server: ReturnType<typeof createHttpServer>) {
       }
 
       if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data.toString());
-    });
-
-    geminiWs.on("error", (err) => {
-      console.error("Gemini Live WebSocket xatosi:", err.message);
-      if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify({ type: "error", message: "Gemini bilan ulanishda xatolik: " + err.message }));
     });
 
     geminiWs.on("close", () => {
