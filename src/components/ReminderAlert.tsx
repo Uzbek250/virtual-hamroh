@@ -1,0 +1,7 @@
+import { AnimatePresence, motion } from "motion/react";
+import { Bell } from "lucide-react";
+import { Reminder } from "../types";
+interface ReminderAlertProps { reminder: Reminder | null; onDismiss: () => void; }
+export default function ReminderAlert({ reminder, onDismiss }: ReminderAlertProps) {
+  return <AnimatePresence>{reminder && <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50"><motion.div initial={{ scale: .9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: .9, opacity: 0 }} className="bg-white rounded-3xl max-w-sm w-full p-6 text-center shadow-2xl border-2 border-indigo-400 flex flex-col items-center gap-4" id="active-alert-modal"><div className="h-16 w-16 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-500 flex items-center justify-center animate-bounce"><Bell size={32} /></div><div><span className="text-xs font-bold uppercase tracking-widest text-indigo-600">⏰ Eslatma Vaqti Keldi!</span><h3 className="text-lg font-extrabold text-slate-800 mt-1 leading-snug">{reminder.text}</h3><p className="text-xs text-slate-400 font-bold mt-2">Rejalashtirilgan vaqt: {reminder.timeString}</p></div><button onClick={onDismiss} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-2xl text-sm transition-all shadow-md shadow-indigo-600/10" id="active-alert-dismiss">Tushundim, Bajarildi! ✅</button></motion.div></div>}</AnimatePresence>;
+}
