@@ -2,11 +2,21 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 export type LiveStatus = "idle" | "connecting" | "listening" | "speaking" | "error";
 
+export interface LiveActionEvent {
+  type: "reminderCreated" | "moodCreated";
+  data: any;
+}
+
 interface UseLiveConversationResult {
   status: LiveStatus;
   errorMessage: string | null;
   start: () => Promise<void>;
   stop: () => void;
+}
+
+interface UseLiveConversationOptions {
+  voiceName: string;
+  onAction?: (event: LiveActionEvent) => void;
 }
 
 // Kirish 16kHz, chiqish 24kHz — bular AudioWorklet fayllarida (mic-processor.js,
@@ -18,12 +28,8 @@ interface UseLiveConversationResult {
  * Live API'ga oqizadi, va kelayotgan javob audiosini real vaqtda pleyback
  * qiladi. Backend WebSocket'i (wss emas, ws — brauzer bilan bir xil origin)
  * API kalitni frontendga chiqarmaydi.
- *
- * Eslatma: Live API faqat audio oqimi qaytaradi, matnli chat rejimidagi
- * kabi strukturaviy (emotion/action) JSON javob yo'q — shuning uchun bu
- * hook kayfiyatni aniqlamaydi.
  */
-export function useLiveConversation(): UseLiveConversationResult {
+export function useLiveConversation({ voiceName, onAction }: UseLiveConversationOptions): UseLiveConversationResult {
   const [status, setStatus] = useState<LiveStatus>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -32,6 +38,11 @@ export function useLiveConversation(): UseLiveConversationResult {
   const playerContextRef = useRef<AudioContext | null>(null);
   const playerNodeRef = useRef<AudioWorkletNode | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
+  const onActionRef = useRef(onAction);
+
+  useEffect(() => {
+    onActionRef.current = onAction;
+  }, [onAction]);
 
   const cleanup = useCallback(() => {
     micStreamRef.current?.getTracks().forEach((track) => track.stop());
@@ -65,9 +76,6 @@ export function useLiveConversation(): UseLiveConversationResult {
     setStatus("connecting");
 
     try {
-      // 1) Mikrofonga ruxsat so'raymiz avvaldan — WebSocket ulanishidan
-      // oldin, shunda foydalanuvchi rad etsa server bilan bekorga
-      // ulanmaymiz.
       const micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -78,10 +86,6 @@ export function useLiveConversation(): UseLiveConversationResult {
       });
       micStreamRef.current = micStream;
 
-      // 2) Pleyback uchun AudioContext va worklet tayyorlaymiz. Aniq
-      // sampleRate belgilamaymiz (ba'zi brauzerlarda ishonchsiz) — worklet
-      // o'zi 24kHz kirishni AudioContext'ning haqiqiy chastotasiga
-      // moslashtiradi.
       const playerContext = new AudioContext();
       await playerContext.audioWorklet.addModule("/worklets/player-processor.js");
       const playerNode = new AudioWorkletNode(playerContext, "player-processor");
@@ -89,9 +93,6 @@ export function useLiveConversation(): UseLiveConversationResult {
       playerContextRef.current = playerContext;
       playerNodeRef.current = playerNode;
 
-      // 3) Mikrofon uchun AudioContext va worklet tayyorlaymiz. Xuddi
-      // shunday — aniq sampleRate belgilamaymiz, worklet o'zi 16kHz'ga
-      // resample qiladi.
       const micContext = new AudioContext();
       await micContext.audioWorklet.addModule("/worklets/mic-processor.js");
       const micSource = micContext.createMediaStreamSource(micStream);
@@ -99,14 +100,12 @@ export function useLiveConversation(): UseLiveConversationResult {
       micSource.connect(micNode);
       micContextRef.current = micContext;
 
-      // 4) WebSocket ulanishini ochamiz (bizning /live proxy'imizga).
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const ws = new WebSocket(`${protocol}//${window.location.host}/live`);
+      const params = new URLSearchParams({ voiceName });
+      const ws = new WebSocket(`${protocol}//${window.location.host}/live?${params.toString()}`);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        // Mikrofon bo'laklarini WebSocket ulanganidan keyingina yubora
-        // boshlaymiz.
         micNode.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
           if (ws.readyState !== WebSocket.OPEN) return;
           const base64 = arrayBufferToBase64(event.data);
@@ -145,6 +144,11 @@ export function useLiveConversation(): UseLiveConversationResult {
           return;
         }
 
+        if (data.type === "liveAction" && (data.action === "reminderCreated" || data.action === "moodCreated")) {
+          onActionRef.current?.({ type: data.action, data: data.data });
+          return;
+        }
+
         if (data.setupComplete) {
           setStatus("listening");
           return;
@@ -180,7 +184,7 @@ export function useLiveConversation(): UseLiveConversationResult {
       setStatus("error");
       setErrorMessage(err?.message || "Mikrofonni ochib bo'lmadi.");
     }
-  }, [status, cleanup]);
+  }, [status, cleanup, voiceName]);
 
   useEffect(() => cleanup, [cleanup]);
 
