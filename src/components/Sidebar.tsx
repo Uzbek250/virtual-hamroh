@@ -1,15 +1,27 @@
-import { Bell, Clock, Heart, MessageSquare, X } from "lucide-react";
+import { Bell, Clock, Heart, MessageSquare, Volume2, X } from "lucide-react";
+import { GEMINI_VOICES, GeminiVoiceName } from "../config/voices";
 
 interface SidebarProps {
   activeTab: "chat" | "reminders" | "mood";
   showSidebar: boolean;
   reminderCount: number;
   moodCount: number;
+  voiceName: GeminiVoiceName;
+  onVoiceChange: (voiceName: GeminiVoiceName) => void;
   onSelectTab: (tab: "chat" | "reminders" | "mood") => void;
   onClose: () => void;
 }
 
-export default function Sidebar({ activeTab, showSidebar, reminderCount, moodCount, onSelectTab, onClose }: SidebarProps) {
+export default function Sidebar({
+  activeTab,
+  showSidebar,
+  reminderCount,
+  moodCount,
+  voiceName,
+  onVoiceChange,
+  onSelectTab,
+  onClose,
+}: SidebarProps) {
   const select = (tab: "chat" | "reminders" | "mood") => {
     onSelectTab(tab);
     onClose();
@@ -38,6 +50,23 @@ export default function Sidebar({ activeTab, showSidebar, reminderCount, moodCou
           <span className="flex items-center gap-3"><Heart size={18} /> Kayfiyat Kundaligi</span>
           <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${activeTab === "mood" ? "bg-white/20 text-white" : "bg-sky-200 text-indigo-900"}`}>{moodCount}</span>
         </button>
+      </div>
+
+      <div className="border-t border-sky-200/60 pt-4">
+        <label htmlFor="gemini-voice-select" className="text-xs font-bold text-slate-400 uppercase tracking-widest pl-2 flex items-center gap-2 mb-2">
+          <Volume2 size={14} /> Robot ovozi
+        </label>
+        <select
+          id="gemini-voice-select"
+          value={voiceName}
+          onChange={(event) => onVoiceChange(event.target.value as GeminiVoiceName)}
+          className="w-full rounded-xl border border-sky-200 bg-white/80 px-3 py-2.5 text-sm font-semibold text-slate-700 outline-none focus:ring-2 focus:ring-indigo-300"
+        >
+          {GEMINI_VOICES.map((voice) => (
+            <option key={voice.name} value={voice.name}>{voice.label}</option>
+          ))}
+        </select>
+        <p className="text-[11px] text-slate-500 mt-2 leading-relaxed">Tanlangan ovoz oddiy chat TTS va jonli suhbatda bir xil ishlatiladi.</p>
       </div>
 
       <div className="mt-auto border-t border-sky-200/60 pt-4 flex flex-col gap-2.5">
