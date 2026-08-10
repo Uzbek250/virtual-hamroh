@@ -383,7 +383,7 @@ app.post("/api/chat", async (req, res) => {
 
 const LIVE_MODEL = "gemini-3.1-flash-live-preview";
 
-function buildLiveSystemPrompt(): string {
+function buildLiveSystemPrompt(memories: StoredMemory[] = []): string {
   return `
 Sen "Hamroh" ismli samimiy va hissiyotli virtual hamroh-robotsan. Foydalanuvchi bilan o'zbek tilida (lotin alifbosida) jonli ovozli suhbat qilyapsan.
 
@@ -397,7 +397,7 @@ Qoidalar:
 - Xotira matni qisqa, aniq va uchinchi shaxsda bo'lsin. Masalan: "Foydalanuvchining ismi Aziz" yoki "Imtihonlardan oldin xavotirlanadi".
 - Funksiya natijasini olmaguningcha "qo'shdim" yoki "saqlandi" deb tasdiqlama.
 - Funksiya muvaffaqiyatli natija qaytarganidan keyingina bajarilganini ayt.
-`;
+` + (memories.length ? `\nSaqlangan xotiralar:\n${memories.map((m) => `- ${m.content}`).join("\n")}` : "");
 }
 
 const liveTools = [
@@ -512,7 +512,7 @@ async function executeLiveFunction(name: string, args: any, userId: string) {
 function setupLiveProxy(server: ReturnType<typeof createHttpServer>) {
   const wss = new WebSocketServer({ server, path: "/live" });
 
-  wss.on("connection", (clientWs, request) => {
+  wss.on("connection", async (clientWs, request) => {
     if (apiKeys.length === 0) {
       clientWs.send(JSON.stringify({ type: "error", message: "GEMINI_API_KEY sozlanmagan." }));
       clientWs.close();
@@ -523,7 +523,7 @@ function setupLiveProxy(server: ReturnType<typeof createHttpServer>) {
     const requestedVoice = requestUrl.searchParams.get("voiceName");
     const voiceName = isGeminiVoiceName(requestedVoice) ? requestedVoice : "Kore";
     const userId = safeUserId(requestUrl.searchParams.get("userId"));
-
+    const liveMemories = await listUserData<StoredMemory>("memories", userId, "created_at.desc", 20).catch(() => []);
     const apiKey = apiKeys[keyIndex % apiKeys.length];
     keyIndex++;
     const geminiUrl = "wss://generativelanguage.googleapis.com/ws/" + "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" + `?key=${apiKey}`;
@@ -539,7 +539,7 @@ function setupLiveProxy(server: ReturnType<typeof createHttpServer>) {
             responseModalities: ["AUDIO"],
             speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } },
           },
-          systemInstruction: { parts: [{ text: buildLiveSystemPrompt() }] },
+          systemInstruction: { parts: [{ text: buildLiveSystemPrompt(liveMemories) }] },
           tools: liveTools,
         },
       };
